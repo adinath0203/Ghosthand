@@ -28,6 +28,9 @@ public static class ElementRanker
         // 5. Visual order (top-to-bottom, then left-to-right)
         var sorted = filtered
             .OrderByDescending(e => e.Focused)
+            // Media transport controls usually sit at the bottom of the window and would be cut
+            // by MaxCandidates, yet they're the only evidence that "play X" has succeeded
+            .ThenByDescending(e => IsPlaybackControl(e))
             .ThenByDescending(e => IsInteractive(e.Role))
             .ThenByDescending(e => !string.IsNullOrWhiteSpace(e.DisplayLabel))
             .ThenByDescending(e => e.IsOutcomeEvidence)
@@ -55,6 +58,12 @@ public static class ElementRanker
     public static bool IsInteractive(string role) =>
         InteractiveRoles.Contains(role) ||
         (role.StartsWith("AX", StringComparison.OrdinalIgnoreCase) && InteractiveRoles.Contains(role[2..]));
+
+    public static bool IsPlaybackControl(AccessibilityElement element) =>
+        System.Text.RegularExpressions.Regex.IsMatch(
+            element.DisplayLabel ?? string.Empty,
+            @"^(?:pause|play|resume|now playing|next|previous|skip)\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     private static bool IsOnScreen(AccessibilityElement element)
     {

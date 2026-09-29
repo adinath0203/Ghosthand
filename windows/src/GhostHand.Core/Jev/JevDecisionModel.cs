@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 using GhostHand.Core.Agent;
 using GhostHand.Core.Interfaces;
 using GhostHand.Core.Models;
@@ -28,7 +28,7 @@ public class JevDecisionModel : IDecisionModel
         CancellationToken cancellationToken = default)
     {
         // 1. Build candidate action choices deterministically
-        var candidateChoices = BuildCandidateChoices(goal, elements);
+        var candidateChoices = BuildCandidateChoices(goal, target, elements, history);
 
         // 2. Build compact state object (text-only, no secrets)
         var state = new
@@ -39,6 +39,7 @@ public class JevDecisionModel : IDecisionModel
             step = history.Count + 1,
             actionAttempts = history.Count > 0 ? history.TakeLast(8).ToList() : new List<string> { "nothing yet" },
             elementCount = elements.Count,
+            mediaStatus = DescribeMediaStatus(elements),
             elements = elements.Take(40).Select(e => new
             {
                 id = e.Id,
@@ -57,7 +58,7 @@ public class JevDecisionModel : IDecisionModel
                 candidateChoices,
                 $"Select the single best next action to advance toward: \"{goal}\""),
             ["goalAchieved"] = QuestionDefinition.Boolean(
-                $"Has the user's task \"{goal}\" already been completely fulfilled by the current screen state?")
+                $"Has the user's task \"{goal}\" already been completely fulfilled by the current screen state? {CompletionHint}")
         };
 
         var request = new EvaluateRequest
@@ -78,7 +79,8 @@ public class JevDecisionModel : IDecisionModel
         var response = await _jevClient.EvaluateAsync(request, cancellationToken);
 
         // Check if goal is already completed
-        if (response.TryGetBooleanAnswer("goalAchieved", out var goalProb, out var isAchieved) && isAchieved)
+        if (!JustFailedDone(history) &&
+            response.TryGetBooleanAnswer("goalAchieved", out var goalProb, out var isAchieved) && isAchieved)
         {
             return new AgentDecision
             {
@@ -113,6 +115,7 @@ public class JevDecisionModel : IDecisionModel
             app = Truncate(target.ProcessName, 100),
             window = Truncate(target.WindowTitle, 150),
             actionAttempts = history.TakeLast(6).ToList(),
+            mediaStatus = DescribeMediaStatus(elements),
             visibleControls = elements.Take(30).Select(e => $"{e.DisplayRole}: \"{e.DisplayLabel}\"").ToList()
         };
 
@@ -123,7 +126,7 @@ public class JevDecisionModel : IDecisionModel
             Questions = new Dictionary<string, QuestionDefinition>
             {
                 ["done"] = QuestionDefinition.Boolean(
-                    $"Are ALL requirements of the task \"{goal}\" completely satisfied based on visible controls and recorded actions?")
+                    $"Are ALL requirements of the task \"{goal}\" completely satisfied based on visible controls and recorded actions? {CompletionHint}")
             },
             ProviderOptions = new GatewayProviderOptions
             {
@@ -211,32 +214,86 @@ public class JevDecisionModel : IDecisionModel
         return ActionRiskScore.Harmless;
     }
 
-    private static Dictionary<string, string> BuildCandidateChoices(string goal, IReadOnlyList<AccessibilityElement> elements)
+    /// <summary>
+    /// Buttons whose second press repeats a real-world effect (a second photo, a second message or order)
+    /// are offered only once per task.
+    /// </summary>
+    private static bool IsOneShot(string? label) =>
+        Regex.IsMatch(label ?? string.Empty,
+            @"^(?:take (?:a )?(?:photo|picture|video)|capture|shutter|start recording|send|post|submit|publish|pay|buy|place order|call)\b",
+            RegexOptions.IgnoreCase);
+
+    private static bool JustFailedDone(IReadOnlyList<string> history) =>
+        history.Count > 0 && history[^1].StartsWith($"{AgentOperation.Done}:", StringComparison.OrdinalIgnoreCase);
+
+    private const string CompletionHint =
+        "For play/listen tasks: if mediaStatus says something is playing (a Pause control is visible), the task is done — do not search again.";
+
+    /// <summary>A visible "Pause" control is the standard signal that media is currently playing.</summary>
+    private static string DescribeMediaStatus(IReadOnlyList<AccessibilityElement> elements)
+    {
+        var pause = elements.FirstOrDefault(e =>
+            Regex.IsMatch(e.DisplayLabel ?? string.Empty, @"^pause\b", RegexOptions.IgnoreCase));
+        if (pause != null)
+            return $"PLAYING (a \"{pause.DisplayLabel}\" control is visible)";
+
+        var play = elements.FirstOrDefault(e =>
+            Regex.IsMatch(e.DisplayLabel ?? string.Empty, @"^(?:play|resume)\b", RegexOptions.IgnoreCase));
+        return play != null ? $"not playing (a \"{play.DisplayLabel}\" control is visible)" : "unknown";
+    }
+
+    private static Dictionary<string, string> BuildCandidateChoices(string goal, AppTarget target, IReadOnlyList<AccessibilityElement> elements, IReadOnlyList<string> history)
     {
         var choices = new Dictionary<string, string>();
+
+        // Repeat guard: the model can re-pick an action that "succeeded" without visibly changing
+        // anything (re-typing the same search, re-launching an app) forever. Drop an action once it
+        // has been done twice on the same control; media toggles only once, since a second press pauses.
+        bool AlreadyTried(AgentOperation op, string target, int limit = 2) =>
+            history.Count(h => h.StartsWith($"{op}:{target} ", StringComparison.OrdinalIgnoreCase)) >= limit;
+        bool AlreadyDoneOn(AgentOperation op, string? label, int limit = 2) =>
+            history.Count(h => h.StartsWith($"{op}:", StringComparison.OrdinalIgnoreCase) &&
+                               h.Contains($" ({label ?? string.Empty}) ->", StringComparison.OrdinalIgnoreCase)) >= limit;
 
         // 0. App Launch & URL candidates
         var appCandidates = ExtractAppLaunchCandidates(goal);
         foreach (var app in appCandidates)
         {
+            if (AlreadyTried(AgentOperation.OpenApp, app)) continue;
             choices[$"open_app:{app}"] = $"Launch or switch to application \"{app}\"";
         }
 
-        var urlCandidates = UrlLauncherValidator.ExtractWebUrls(goal);
+        // Synthesized search URLs follow the app the user is in ("play X" while in Spotify → Spotify, not YouTube).
+        // Inside the Spotify desktop app a web URL would only open a browser, so use the in-app search instead.
+        var inSpotifyDesktop = target.ProcessName.Equals("spotify", StringComparison.OrdinalIgnoreCase);
+        var urlCandidates = inSpotifyDesktop && !goal.Contains("http", StringComparison.OrdinalIgnoreCase)
+            ? Array.Empty<Uri>()
+            : UrlLauncherValidator.ExtractWebUrls(goal, $"{target.ProcessName} {target.WindowTitle}");
         foreach (var url in urlCandidates)
         {
+            if (AlreadyTried(AgentOperation.OpenUrl, url.ToString())) continue;
             choices[$"open_url:{url}"] = $"Open web URL \"{url}\" in browser";
         }
 
         // Extract search/literal candidate phrases from user goal
         var textCandidates = ExtractCandidatePhrases(goal);
 
+        // For "play X" tasks: clicking Pause undoes the goal, and once any play/pause toggle has been
+        // used, a further Space/Play key press would pause what just started.
+        var isPlayTask = Regex.IsMatch(goal, @"\b(?:play|listen|stream)\b", RegexOptions.IgnoreCase);
+        var toggledPlayback = history.Any(h =>
+            h.StartsWith($"{AgentOperation.PressSpace}:", StringComparison.OrdinalIgnoreCase) ||
+            h.StartsWith($"{AgentOperation.PressMediaPlay}:", StringComparison.OrdinalIgnoreCase) ||
+            Regex.IsMatch(h, @"^Click:\S* \((?:play|pause|resume)\b", RegexOptions.IgnoreCase));
+
         int clickCount = 0;
         foreach (var el in elements)
         {
             if (!el.Enabled) continue;
+            if (isPlayTask && Regex.IsMatch(el.DisplayLabel ?? string.Empty, @"^pause\b", RegexOptions.IgnoreCase)) continue;
 
-            if (IsClickable(el.Role) && clickCount < 25)
+            if (IsClickable(el.Role) && clickCount < 25 &&
+                !AlreadyDoneOn(AgentOperation.Click, el.DisplayLabel, limit: IsOneShot(el.DisplayLabel) ? 1 : 2))
             {
                 clickCount++;
                 var key = $"click:{el.Id}";
@@ -244,7 +301,8 @@ public class JevDecisionModel : IDecisionModel
                 choices[key] = desc;
             }
 
-            if (IsTypeable(el.Role) && textCandidates.Count > 0)
+            var typedHere = AlreadyDoneOn(AgentOperation.TypeAndEnter, el.DisplayLabel) || AlreadyDoneOn(AgentOperation.TypeText, el.DisplayLabel);
+            if (IsTypeable(el.Role) && textCandidates.Count > 0 && !typedHere)
             {
                 foreach (var textCandidate in textCandidates.Take(3))
                 {
@@ -267,14 +325,19 @@ public class JevDecisionModel : IDecisionModel
 
         // Standard actions
         choices["press:enter"] = "Press Enter/Return key";
-        choices["press:space"] = "Press Spacebar to play/pause or select";
-        choices["press:media_play"] = "Press Media Play key to toggle playback";
+        if (!toggledPlayback)
+        {
+            choices["press:space"] = "Press Spacebar to play/pause or select";
+            choices["press:media_play"] = "Press Media Play key to toggle playback";
+        }
         choices["press:tab"] = "Press Tab key to advance focus";
         choices["press:escape"] = "Press Escape key to dismiss dialog/menu";
         choices["scroll:down"] = "Scroll down to reveal more controls";
         choices["scroll:up"] = "Scroll up";
         choices["wait"] = "Wait 1 second for UI to update";
-        choices["done"] = "Task is completely finished";
+        // Right after a "done" that failed verification, force a real action instead of claiming done again
+        if (!JustFailedDone(history))
+            choices["done"] = "Task is completely finished";
         choices["ask_user"] = "Need human guidance or clarification";
 
         return choices;
@@ -393,6 +456,9 @@ public class JevDecisionModel : IDecisionModel
     {
         var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Speech-to-text punctuation ("write, hello", "search: weather") would hide the text from the verbs below
+        goal = Regex.Replace(goal, @"\b(write|type|enter|insert|put|search|find|play|stream|calculate|compute)\s*[,:]\s*", "$1 ", RegexOptions.IgnoreCase);
+
         // 1. Quoted text: "Adele", 'Hello World'
         foreach (Match m in Regex.Matches(goal, @"[""']([^""']+)[""']"))
         {
@@ -471,7 +537,7 @@ public class JevDecisionModel : IDecisionModel
 
         if (match.Success)
         {
-            var app = match.Groups[1].Value.Trim();
+            var app = NormalizeAppName(match.Groups[1].Value);
             string[] stopWords = ["menu", "tab", "link", "window", "dialog", "document", "file", "page", "browser", "app", "application"];
             if (!stopWords.Contains(app, StringComparer.OrdinalIgnoreCase) && app.Length > 0)
             {
@@ -479,7 +545,49 @@ public class JevDecisionModel : IDecisionModel
             }
         }
 
+        // Well-known apps named anywhere in the goal ("play X on spotify") are also launch candidates
+        foreach (Match m in Regex.Matches(goal, @"\b(?:on|in|using|with)\s+([a-zA-Z0-9\-_]+)", RegexOptions.IgnoreCase))
+        {
+            var app = NormalizeAppName(m.Groups[1].Value);
+            if (KnownApps.Contains(app))
+                candidates.Add(app);
+        }
+
         return candidates.ToList();
+    }
+
+    private static readonly HashSet<string> KnownApps = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "spotify", "chrome", "msedge", "firefox", "brave", "opera", "notepad", "calculator",
+        "discord", "slack", "teams", "whatsapp", "telegram", "vlc", "outlook", "word", "excel", "powerpoint"
+    };
+
+    // Common spoken names / misspellings → launchable app names
+    private static readonly Dictionary<string, string> AppAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["crome"] = "chrome",
+        ["chrom"] = "chrome",
+        ["chorme"] = "chrome",
+        ["google chrome"] = "chrome",
+        ["edge"] = "msedge",
+        ["microsoft edge"] = "msedge",
+        ["mozilla firefox"] = "firefox",
+        ["fire fox"] = "firefox",
+        ["spotfy"] = "spotify",
+        ["spotify music"] = "spotify",
+        ["calc"] = "calculator",
+        ["note pad"] = "notepad"
+    };
+
+    /// <summary>"the crome browser" → "chrome": drops articles and generic suffixes, then applies aliases.</summary>
+    private static string NormalizeAppName(string raw)
+    {
+        var app = raw.Trim();
+        app = Regex.Replace(app, @"^(?:the|a|an|my)\s+", "", RegexOptions.IgnoreCase).Trim();
+        var stripped = Regex.Replace(app, @"\s+(?:browser|app|application|program)$", "", RegexOptions.IgnoreCase).Trim();
+        if (stripped.Length > 0)
+            app = stripped;
+        return AppAliases.TryGetValue(app, out var alias) ? alias : app;
     }
 
     private static string Truncate(string text, int maxChars)

@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using GhostHand.Core.Agent;
 using GhostHand.Core.Interfaces;
 using GhostHand.Core.Jev;
@@ -32,6 +32,7 @@ public class AppLauncher : IAppLauncher
     public AppLauncher(ILogger<AppLauncher>? logger = null)
     {
         _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<AppLauncher>.Instance;
+        StoreAppCatalog.Preload();
     }
 
     public bool TryExtractAppLaunch(string goal, out string appName, out string launchCommand)
@@ -152,9 +153,24 @@ public class AppLauncher : IAppLauncher
         return await WaitForNewForegroundTargetAsync(null, cancellationToken);
     }
 
+    // Built-in Windows surfaces that have no app entry of their own, or whose name also matches other
+    // Start-menu shortcuts ("settings" used to open "WSL Settings")
+    private static readonly Dictionary<string, string> WindowsUriAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["settings"] = "ms-settings:",
+        ["windows settings"] = "ms-settings:",
+        ["control panel"] = "control",
+    };
+
     private static bool ResolveLaunchCommand(string appName, out string launchCommand)
     {
         var trimmed = appName.Trim();
+
+        if (WindowsUriAliases.TryGetValue(trimmed, out var alias))
+        {
+            launchCommand = alias;
+            return true;
+        }
 
         // 1. Windows App Paths registry lookup (registered desktop apps)
         if (TryFindInAppPathsRegistry(trimmed, out var appPath))
@@ -167,6 +183,13 @@ public class AppLauncher : IAppLauncher
         if (TryFindStartMenuShortcut(trimmed, out var shortcutPath))
         {
             launchCommand = shortcutPath;
+            return true;
+        }
+
+        // 2b. Microsoft Store apps (Camera, Photos, Clock, Store editions of WhatsApp/Spotify, ...)
+        if (StoreAppCatalog.TryFind(trimmed, TimeSpan.FromSeconds(3), out var aumid))
+        {
+            launchCommand = $@"shell:AppsFolder\{aumid}";
             return true;
         }
 
@@ -354,6 +377,12 @@ public class AppLauncher : IAppLauncher
 
     public static string GetExpectedProcessName(string appName, string? command)
     {
+        // Store apps run in ApplicationFrameHost / their own host; match the window by the app's name
+        if (!string.IsNullOrEmpty(command) && command.StartsWith("shell:AppsFolder", StringComparison.OrdinalIgnoreCase))
+        {
+            return appName.Trim();
+        }
+
         if (!string.IsNullOrEmpty(command) && (command.Equals("ms-settings:", StringComparison.OrdinalIgnoreCase) ||
             appName.Contains("settings", StringComparison.OrdinalIgnoreCase)))
         {

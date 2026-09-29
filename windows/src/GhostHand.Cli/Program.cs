@@ -59,10 +59,12 @@ public static class Program
         Console.WriteLine("  .NET Runtime: " + Environment.Version);
 
         var options = JevOptions.FromEnvironment();
+        var keyName = options.Provider == JevProvider.OpenRouter ? "OPENROUTER_API_KEY" : "AI_GATEWAY_API_KEY";
+        var providerName = options.Provider == JevProvider.OpenRouter ? "OpenRouter" : "Vercel AI Gateway";
         if (string.IsNullOrWhiteSpace(options.ApiKey))
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine("  AI_GATEWAY_API_KEY: [NOT CONFIGURED] (Set in .env or as environment variable)");
+            Console.WriteLine($"  {keyName}: [NOT CONFIGURED] (Set in .env or as environment variable)");
             Console.ResetColor();
             Console.WriteLine("Cannot perform Jev evaluation without API key.");
             return 1;
@@ -72,16 +74,16 @@ public static class Program
             ? $"{options.ApiKey[..4]}...{options.ApiKey[^4..]}" 
             : "[CONFIGURED]";
         Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"  AI_GATEWAY_API_KEY: {redacted} (Loaded)");
+        Console.WriteLine($"  {keyName}: {redacted} (Loaded)");
         Console.ResetColor();
 
-        Console.WriteLine("\nTesting live Jev model via Vercel AI Gateway...");
+        Console.WriteLine($"\nTesting live decision model via {providerName}...");
         Console.WriteLine($"  Gateway Base URL: {options.BaseUrl}");
         Console.WriteLine($"  Model: {options.ModelId}");
         Console.WriteLine($"  Zero Data Retention: {options.ZeroDataRetention}");
 
         using var httpClient = new HttpClient();
-        var client = new JevClient(httpClient, options, NullLogger<JevClient>.Instance);
+        var client = JevClientFactory.Create(httpClient, options);
 
         var request = new EvaluateRequest
         {
@@ -89,7 +91,7 @@ public static class Program
             State = new
             {
                 system = "GhostHand Windows Diagnostic",
-                status = "Testing connectivity to Vercel AI Gateway",
+                status = $"Testing connectivity to {providerName}",
                 timestamp = DateTime.UtcNow
             },
             Questions = new Dictionary<string, QuestionDefinition>
@@ -141,7 +143,7 @@ public static class Program
         {
             Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine($"\n[AUTH ERROR] Authentication failed: {ex.Message}");
-            Console.WriteLine("Please double-check that your AI_GATEWAY_API_KEY in .env is valid.");
+            Console.WriteLine($"Please double-check that your {keyName} in .env is valid.");
             Console.ResetColor();
             return 1;
         }
@@ -358,7 +360,7 @@ public static class Program
 
         var jevOptions = JevOptions.FromEnvironment();
         using var httpClient = new HttpClient();
-        var jevClient = new JevClient(httpClient, jevOptions, NullLogger<JevClient>.Instance);
+        var jevClient = JevClientFactory.Create(httpClient, jevOptions);
         var decisionModel = new JevDecisionModel(jevClient, jevOptions, jevLogger);
 
         var ocrService = new WindowsOcrService(ocrLogger);

@@ -30,6 +30,35 @@ public class WindowCaptureService : IWindowCaptureService, IWindowTracker
     }
 
     /// <summary>Topmost visible, titled top-level window that doesn't belong to GhostHand.</summary>
+    /// <summary>
+    /// Topmost visible window titled with this app name ("Calculator", "Camera"). Store apps' windows belong to
+    /// ApplicationFrameHost, so they can't be found by process name.
+    /// </summary>
+    public static unsafe AppTarget? CaptureWindowByTitle(string appName)
+    {
+        if (string.IsNullOrWhiteSpace(appName)) return null;
+        var name = appName.Trim();
+        AppTarget? found = null;
+        PInvoke.EnumWindows((hwnd, _) =>
+        {
+            if (!PInvoke.IsWindowVisible(hwnd))
+                return true;
+            var candidate = CaptureWindowByHwnd(hwnd);
+            if (candidate == null || IsSelf(candidate) || string.IsNullOrWhiteSpace(candidate.WindowTitle))
+                return true;
+            var title = candidate.WindowTitle.Trim();
+            if (title.Equals(name, StringComparison.OrdinalIgnoreCase) ||
+                title.StartsWith(name + " ", StringComparison.OrdinalIgnoreCase) ||
+                title.EndsWith(" - " + name, StringComparison.OrdinalIgnoreCase))
+            {
+                found = candidate;
+                return false;
+            }
+            return true;
+        }, 0);
+        return found;
+    }
+
     public static unsafe AppTarget? CaptureTopmostExternalWindow()
     {
         AppTarget? found = null;

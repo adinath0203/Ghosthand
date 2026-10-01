@@ -27,6 +27,21 @@ public class JevDecisionModel : IDecisionModel
         IReadOnlyList<string> history,
         CancellationToken cancellationToken = default)
     {
+        // 0. Calculations are checked exactly: once the expression was typed and the app shows its value, done
+        var expression = ExtractMathExpression(goal);
+        var expected = expression != null ? EvaluateExpression(expression) : null;
+        if (expected != null &&
+            history.Any(h => h.StartsWith($"{AgentOperation.TypeKeys}:", StringComparison.OrdinalIgnoreCase)) &&
+            ScreenShowsNumber(elements, expected.Value))
+        {
+            return new AgentDecision
+            {
+                Operation = AgentOperation.Done,
+                Reason = $"Calculation result {FormatNumber(expected.Value)} is shown",
+                Confidence = 1.0
+            };
+        }
+
         // 1. Build candidate action choices deterministically
         var candidateChoices = BuildCandidateChoices(goal, target, elements, history);
 
@@ -40,6 +55,7 @@ public class JevDecisionModel : IDecisionModel
             actionAttempts = history.Count > 0 ? history.TakeLast(8).ToList() : new List<string> { "nothing yet" },
             elementCount = elements.Count,
             mediaStatus = DescribeMediaStatus(elements),
+            expectedCalculationResult = expected != null ? FormatNumber(expected.Value) : null,
             elements = elements.Take(40).Select(e => new
             {
                 id = e.Id,
@@ -286,10 +302,17 @@ public class JevDecisionModel : IDecisionModel
             h.StartsWith($"{AgentOperation.PressMediaPlay}:", StringComparison.OrdinalIgnoreCase) ||
             Regex.IsMatch(h, @"^Click:\S* \((?:play|pause|resume)\b", RegexOptions.IgnoreCase));
 
+        // Calculations are typed in one go (keys: option below). Clicking keypad buttons as well mixes the two
+        // inputs: "Three", "Four", then typing "3+4" made Calculator compute 343+4
+        var mathExpression = ExtractMathExpression(goal);
+        var keysTries = history.Count(h => h.StartsWith($"{AgentOperation.TypeKeys}:", StringComparison.OrdinalIgnoreCase));
+        var hideKeypad = mathExpression != null && keysTries < 2;
+
         int clickCount = 0;
         foreach (var el in elements)
         {
             if (!el.Enabled) continue;
+            if (hideKeypad && IsKeypadButton(el)) continue;
             if (isPlayTask && Regex.IsMatch(el.DisplayLabel ?? string.Empty, @"^pause\b", RegexOptions.IgnoreCase)) continue;
 
             if (IsClickable(el.Role) && clickCount < 25 &&
@@ -323,6 +346,13 @@ public class JevDecisionModel : IDecisionModel
             }
         }
 
+        // Keyboard entry for a calculation ("do 450 + 40", "what is 12 times 8"): apps like Calculator have
+        // no text box to type into, and clicking digit buttons one step at a time is slow and error-prone
+        if (mathExpression != null && keysTries < 2)
+        {
+            choices[$"keys:{mathExpression}"] = $"Clear, type \"{mathExpression}\" on the keyboard and press Enter (enters the whole calculation into the focused app)";
+        }
+
         // Standard actions
         choices["press:enter"] = "Press Enter/Return key";
         if (!toggledPlayback)
@@ -332,8 +362,15 @@ public class JevDecisionModel : IDecisionModel
         }
         choices["press:tab"] = "Press Tab key to advance focus";
         choices["press:escape"] = "Press Escape key to dismiss dialog/menu";
-        choices["scroll:down"] = "Scroll down to reveal more controls";
-        choices["scroll:up"] = "Scroll up";
+        // Three scrolls in a row that changed nothing useful: stop offering scrolling
+        var recentScrolls = history.TakeLast(3).Count(h =>
+            h.StartsWith($"{AgentOperation.ScrollDown}:", StringComparison.OrdinalIgnoreCase) ||
+            h.StartsWith($"{AgentOperation.ScrollUp}:", StringComparison.OrdinalIgnoreCase));
+        if (recentScrolls < 3)
+        {
+            choices["scroll:down"] = "Scroll down to reveal more controls";
+            choices["scroll:up"] = "Scroll up";
+        }
         choices["wait"] = "Wait 1 second for UI to update";
         // Right after a "done" that failed verification, force a real action instead of claiming done again
         if (!JustFailedDone(history))
@@ -345,6 +382,18 @@ public class JevDecisionModel : IDecisionModel
 
     private static AgentDecision ParseActionDecision(string key, double confidence, IReadOnlyList<AccessibilityElement> elements)
     {
+        if (key.StartsWith("keys:", StringComparison.OrdinalIgnoreCase))
+        {
+            var keys = key[5..];
+            return new AgentDecision
+            {
+                Operation = AgentOperation.TypeKeys,
+                TextValue = keys,
+                Confidence = confidence,
+                Reason = $"Type '{keys}' on the keyboard"
+            };
+        }
+
         if (key.StartsWith("open_app:", StringComparison.OrdinalIgnoreCase))
         {
             var appName = key[9..].Trim();
@@ -451,6 +500,71 @@ public class JevDecisionModel : IDecisionModel
         role.Equals("Edit", StringComparison.OrdinalIgnoreCase) ||
         role.Equals("Document", StringComparison.OrdinalIgnoreCase) ||
         role.Equals("ComboBox", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The arithmetic in a goal as keyboard input: "do 450 + 40" → "450+40", "what is 12 times 8" → "12*8",
+    /// "100 divided by 4" → "100/4". Null when the goal contains no calculation.
+    /// </summary>
+    public static string? ExtractMathExpression(string goal)
+    {
+        if (string.IsNullOrWhiteSpace(goal)) return null;
+
+        var text = goal.ToLowerInvariant();
+        text = Regex.Replace(text, @"\bmultiplied\s+by\b|\btimes\b|\binto\b|[x×]\s*(?=\d)", " * ");
+        text = Regex.Replace(text, @"\bdivided\s+by\b|÷|\bover\b", " / ");
+        text = Regex.Replace(text, @"\bplus\b|\band\s+add\b", " + ");
+        text = Regex.Replace(text, @"\bminus\b", " - ");
+        text = Regex.Replace(text, @"(?<=\d),(?=\d{3}\b)", ""); // 1,200 → 1200
+
+        var match = Regex.Match(text, @"\(?\s*\d+(?:\.\d+)?(?:\s*\)?\s*[-+*/%]\s*\(?\s*\d+(?:\.\d+)?\s*\)?)+");
+        if (!match.Success) return null;
+
+        var expression = Regex.Replace(match.Value, @"\s+", "");
+        return Regex.IsMatch(expression, @"[-+*/%]") ? expression : null;
+    }
+
+    private static readonly Regex KeypadLabel = new(
+        @"^(?:zero|one|two|three|four|five|six|seven|eight|nine|plus|minus|multiply by|divide by|equals|decimal separator|positive negative|percent|[0-9]|[-+*/=.×÷])$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static bool IsKeypadButton(AccessibilityElement el) =>
+        el.Role.Equals("Button", StringComparison.OrdinalIgnoreCase) && KeypadLabel.IsMatch((el.DisplayLabel ?? string.Empty).Trim());
+
+    /// <summary>Value of a simple expression ("450*2+90" → 990), or null if it can't be evaluated.</summary>
+    public static decimal? EvaluateExpression(string expression)
+    {
+        try
+        {
+            var value = new System.Data.DataTable().Compute(expression.Replace("%", "/100*"), null);
+            return value is DBNull or null ? null : Convert.ToDecimal(value, System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string FormatNumber(decimal value) =>
+        Math.Round(value, 10).ToString("0.##########", System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>Whether a text on screen shows this number ("Display is 1,234", "990"), ignoring thousands separators.</summary>
+    private static bool ScreenShowsNumber(IReadOnlyList<AccessibilityElement> elements, decimal value)
+    {
+        var target = Math.Round(value, 6);
+        foreach (var el in elements)
+        {
+            if (el.Role.Equals("Button", StringComparison.OrdinalIgnoreCase)) continue;
+            var text = $"{el.Label} {el.Value}";
+            foreach (Match m in Regex.Matches(text, @"-?\d[\d,\s]*(?:\.\d+)?"))
+            {
+                var digits = Regex.Replace(m.Value, @"[,\s]", "");
+                if (decimal.TryParse(digits, System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out var shown) &&
+                    Math.Round(shown, 6) == target)
+                    return true;
+            }
+        }
+        return false;
+    }
 
     public static List<string> ExtractCandidatePhrases(string goal)
     {
@@ -576,6 +690,8 @@ public class JevDecisionModel : IDecisionModel
         ["spotfy"] = "spotify",
         ["spotify music"] = "spotify",
         ["calc"] = "calculator",
+        ["vs code"] = "visual studio code",
+        ["vscode"] = "visual studio code",
         ["note pad"] = "notepad"
     };
 

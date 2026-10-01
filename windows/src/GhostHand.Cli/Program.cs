@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using GhostHand.Core.Agent;
 using GhostHand.Core.Common;
 using GhostHand.Core.Jev;
@@ -59,9 +59,25 @@ public static class Program
         Console.WriteLine("  .NET Runtime: " + Environment.Version);
 
         var options = JevOptions.FromEnvironment();
-        var keyName = options.Provider == JevProvider.OpenRouter ? "OPENROUTER_API_KEY" : "AI_GATEWAY_API_KEY";
-        var providerName = options.Provider == JevProvider.OpenRouter ? "OpenRouter" : "Vercel AI Gateway";
-        if (string.IsNullOrWhiteSpace(options.ApiKey))
+        var keyName = options.Provider switch
+        {
+            JevProvider.OpenRouter => "OPENROUTER_API_KEY",
+            JevProvider.Laya => "LAYA_API_KEY",
+            JevProvider.Groq => "GROQ_API_KEY",
+            _ => "AI_GATEWAY_API_KEY"
+        };
+        var providerName = options.Provider switch
+        {
+            JevProvider.OpenRouter => "OpenRouter",
+            JevProvider.Laya => $"Laya ({options.BaseUrl})",
+            JevProvider.Groq => "Groq",
+            _ => "Vercel AI Gateway"
+        };
+        if (options.Provider == JevProvider.Laya && string.IsNullOrWhiteSpace(options.ApiKey))
+        {
+            Console.WriteLine($"  {keyName}: not set (fine for a local laya-serve)");
+        }
+        else if (string.IsNullOrWhiteSpace(options.ApiKey))
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine($"  {keyName}: [NOT CONFIGURED] (Set in .env or as environment variable)");
@@ -69,13 +85,15 @@ public static class Program
             Console.WriteLine("Cannot perform Jev evaluation without API key.");
             return 1;
         }
-
-        var redacted = options.ApiKey.Length > 8 
-            ? $"{options.ApiKey[..4]}...{options.ApiKey[^4..]}" 
-            : "[CONFIGURED]";
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"  {keyName}: {redacted} (Loaded)");
-        Console.ResetColor();
+        else
+        {
+            var redacted = options.ApiKey.Length > 8
+                ? $"{options.ApiKey[..4]}...{options.ApiKey[^4..]}"
+                : "[CONFIGURED]";
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"  {keyName}: {redacted} (Loaded)");
+            Console.ResetColor();
+        }
 
         Console.WriteLine($"\nTesting live decision model via {providerName}...");
         Console.WriteLine($"  Gateway Base URL: {options.BaseUrl}");

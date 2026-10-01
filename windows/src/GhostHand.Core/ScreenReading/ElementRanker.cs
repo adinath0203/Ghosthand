@@ -10,6 +10,9 @@ public static class ElementRanker
         "RadioButton", "ComboBox", "ListItem", "Edit", "Document", "SplitButton"
     };
 
+    /// <summary>Slots kept for labelled status/result text, so buttons can't crowd it out.</summary>
+    public const int ReservedEvidenceSlots = 8;
+
     public static IReadOnlyList<AccessibilityElement> RankAndFilter(
         IEnumerable<AccessibilityElement> elements,
         ScreenReaderOptions options)
@@ -38,8 +41,17 @@ public static class ElementRanker
             .ThenBy(e => e.Frame.X)
             .ToList();
 
-        // Cap to MaxCandidates while preserving top elements
-        var candidateList = sorted.Take(options.MaxCandidates).ToList();
+        // Cap to MaxCandidates, but reserve room for labelled status text. Interactive controls rank first, so a
+        // button-heavy window (Calculator: 40+ buttons) used to push out its only result ("Display is 95"),
+        // leaving the model no way to see that an action worked or that the task is done.
+        var evidence = sorted
+            .Where(e => e.IsOutcomeEvidence && !IsInteractive(e.Role) && !string.IsNullOrWhiteSpace(e.DisplayLabel))
+            .OrderBy(e => e.Frame.Y).ThenBy(e => e.Frame.X)
+            .Take(Math.Min(ReservedEvidenceSlots, options.MaxCandidates / 4))
+            .ToHashSet(ReferenceEqualityComparer.Instance);
+        var others = sorted.Where(e => !evidence.Contains(e)).Take(options.MaxCandidates - evidence.Count)
+            .ToHashSet(ReferenceEqualityComparer.Instance);
+        var candidateList = sorted.Where(e => evidence.Contains(e) || others.Contains(e)).ToList();
 
         // Assign stable sequential IDs: e1, e2, e3...
         var result = new List<AccessibilityElement>(candidateList.Count);

@@ -49,19 +49,26 @@ public class OpenRouterJevClient : IJevClient
     public async Task<EvaluateResponse> EvaluateAsync(EvaluateRequest request, CancellationToken cancellationToken = default)
     {
         var apiKey = _options.ApiKey;
-        if (string.IsNullOrWhiteSpace(apiKey))
+        var isLaya = _options.Provider == JevProvider.Laya;
+        if (string.IsNullOrWhiteSpace(apiKey) && !isLaya)
         {
-            throw new AuthException("API key is not configured. Set OPENROUTER_API_KEY in .env or environment.");
+            throw new AuthException(_options.Provider == JevProvider.Groq
+                ? "API key is not configured. Set GROQ_API_KEY in .env or environment."
+                : "API key is not configured. Set OPENROUTER_API_KEY in .env or environment.");
         }
 
         // Jev on OpenRouter (~typesafe/jev-latest) is a "decisions" model: it natively answers typed
         // questions via /api/alpha/decisions and is rejected by /chat/completions.
-        var decisions = IsDecisionsModel(_options.ModelId);
-        var url = decisions ? DecisionsUrl(_options.BaseUrl) : $"{_options.BaseUrl.TrimEnd('/')}/chat/completions";
+        // Laya (laya-serve) implements the same typed-decisions contract at /v1/systemone
+        var decisions = isLaya || (_options.Provider != JevProvider.Groq && IsDecisionsModel(_options.ModelId));
+        var url = isLaya
+            ? $"{_options.BaseUrl.TrimEnd('/')}/v1/systemone"
+            : decisions ? DecisionsUrl(_options.BaseUrl) : $"{_options.BaseUrl.TrimEnd('/')}/chat/completions";
         var requestJson = (decisions ? BuildDecisionsRequest(request) : BuildChatRequest(request)).ToJsonString(JsonOpts);
 
         var stopwatch = Stopwatch.StartNew();
         int attempts = 0;
+        var correctionSent = false;
 
         while (true)
         {
@@ -72,7 +79,8 @@ public class OpenRouterJevClient : IJevClient
             {
                 Content = new StringContent(requestJson, Encoding.UTF8, "application/json")
             };
-            httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            if (!string.IsNullOrWhiteSpace(apiKey))
+                httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
             httpRequest.Headers.TryAddWithoutValidation("HTTP-Referer", "https://github.com/dushyantzz/Ghosthand");
             httpRequest.Headers.TryAddWithoutValidation("X-Title", "GhostHand");
 
@@ -114,8 +122,26 @@ public class OpenRouterJevClient : IJevClient
 
             if (response.IsSuccessStatusCode)
             {
-                var result = decisions ? ParseDecisionsResponse(responseBody, request) : ParseChatResponse(responseBody, request);
-                _logger.LogInformation("OpenRouter evaluation completed in {LatencyMs}ms", stopwatch.ElapsedMilliseconds);
+                if (decisions)
+                {
+                    var decided = ParseDecisionsResponse(responseBody, request);
+                    _logger.LogInformation("Decision completed in {LatencyMs}ms", stopwatch.ElapsedMilliseconds);
+                    return decided;
+                }
+
+                var result = ParseChatResponse(responseBody, request, out var unmappedChoices, out var reply);
+
+                // A chat model occasionally names an option that doesn't exist; ask once more, saying why,
+                // instead of failing the step with "Could not parse decision"
+                if (unmappedChoices.Count > 0 && !correctionSent)
+                {
+                    correctionSent = true;
+                    requestJson = BuildCorrectionRequest(request, reply, unmappedChoices).ToJsonString(JsonOpts);
+                    _logger.LogWarning("Model chose an invalid option for {Questions}; asking again.", string.Join(", ", unmappedChoices));
+                    continue;
+                }
+
+                _logger.LogInformation("Decision completed in {LatencyMs}ms", stopwatch.ElapsedMilliseconds);
                 return result;
             }
 
@@ -170,12 +196,22 @@ public class OpenRouterJevClient : IJevClient
             questions[name] = node;
         }
 
-        return new JsonObject
+        var body = new JsonObject
         {
             ["model"] = _options.ModelId,
             ["state"] = JsonSerializer.SerializeToNode(request.State, JsonOpts),
             ["questions"] = questions
         };
+
+        if (_options.Provider == JevProvider.Laya)
+        {
+            // Laya packs options + state into one encoder sequence; its defaults (192 option tokens,
+            // 512-1024 total) would truncate a GhostHand step's 20-60 options and 40 screen controls
+            body["max_len"] = _options.LayaMaxLen;
+            body["head_max_len"] = _options.LayaHeadMaxLen;
+        }
+
+        return body;
     }
 
     /// <summary>
@@ -286,6 +322,9 @@ public class OpenRouterJevClient : IJevClient
                 foreach (var (key, desc) in options)
                     numbered[(i++).ToString()] = string.IsNullOrWhiteSpace(desc) ? key : desc;
                 node["options"] = numbered;
+                // Screen elements are also numbered (e1..e40); without this, models sometimes answer an element
+                // number ("choice": 40) instead of an option number
+                node["answer_with"] = $"one option number from 1 to {options.Count} (not an element id)";
             }
             else if (q.Criteria != null)
             {
@@ -315,12 +354,51 @@ public class OpenRouterJevClient : IJevClient
             body["provider"] = new JsonObject { ["data_collection"] = "deny" };
         }
 
+        if (_options.ChatReasoning is bool reasoning)
+        {
+            if (_options.Provider == JevProvider.Groq)
+            {
+                // Groq's parameter: "none" disables thinking on Qwen 3.x; gpt-oss models can't turn it off,
+                // "low" is their minimum
+                if (!reasoning)
+                    body["reasoning_effort"] = _options.ModelId.Contains("gpt-oss", StringComparison.OrdinalIgnoreCase) ? "low" : "none";
+            }
+            else
+            {
+                body["reasoning"] = new JsonObject { ["enabled"] = reasoning };
+            }
+        }
+
+        if (_options.ZeroDataRetention && _options.Provider == JevProvider.Groq)
+        {
+            body.Remove("provider"); // OpenRouter-only field
+        }
+
         return body;
     }
 
-    internal static EvaluateResponse ParseChatResponse(string responseBody, EvaluateRequest request)
+    /// <summary>The original request plus the invalid reply and a short correction naming the valid range.</summary>
+    private JsonObject BuildCorrectionRequest(EvaluateRequest request, string reply, IReadOnlyList<string> unmappedChoices)
     {
-        string content;
+        var body = BuildChatRequest(request);
+        var ranges = string.Join("; ", unmappedChoices.Select(name =>
+            $"\"{name}\" must be an option number from 1 to {(request.Questions[name].Criteria as Dictionary<string, string>)?.Count ?? 0}"));
+        var messages = (JsonArray)body["messages"]!;
+        messages.Add(new JsonObject { ["role"] = "assistant", ["content"] = reply });
+        messages.Add(new JsonObject
+        {
+            ["role"] = "user",
+            ["content"] = $"That choice is not one of the listed options: {ranges}. Reply again with the same JSON object, using a listed option number."
+        });
+        return body;
+    }
+
+    internal static EvaluateResponse ParseChatResponse(string responseBody, EvaluateRequest request) =>
+        ParseChatResponse(responseBody, request, out _, out _);
+
+    internal static EvaluateResponse ParseChatResponse(string responseBody, EvaluateRequest request,
+        out List<string> unmappedChoices, out string content)
+    {
         UsageInfo? usage = null;
         try
         {
@@ -387,8 +465,13 @@ public class OpenRouterJevClient : IJevClient
         }
 
         var unmapped = request.Questions.Keys.Where(k => modelAnswers[k] != null && !answers.ContainsKey(k)).ToList();
+        unmappedChoices = unmapped.Where(k => request.Questions[k].Type == "choice").ToList();
         if (unmapped.Count > 0)
-            DebugLog($"Could not map answers for [{string.Join(", ", unmapped)}]\nReply: {content}");
+        {
+            var optionCounts = string.Join(", ", unmapped.Select(k =>
+                $"{k}: {(request.Questions[k].Criteria as Dictionary<string, string>)?.Count ?? 0} options"));
+            DebugLog($"Could not map answers for [{optionCounts}]\nReply: {content}");
+        }
 
         return new EvaluateResponse { Answers = answers, Usage = usage };
     }
@@ -424,6 +507,19 @@ public class OpenRouterJevClient : IJevClient
 
             match ??= keys.FirstOrDefault(k => string.Equals(k, raw, StringComparison.OrdinalIgnoreCase))
                 ?? options.FirstOrDefault(kv => string.Equals(kv.Value, raw, StringComparison.OrdinalIgnoreCase)).Key;
+
+            // An out-of-range number or "e40" / "click:e40" is usually an element id: use that element's action
+            if (match == null)
+            {
+                var element = Regex.Match(raw, @"^(?:click:)?e?(\d+)$", RegexOptions.IgnoreCase);
+                if (element.Success)
+                {
+                    var id = "e" + element.Groups[1].Value;
+                    match = keys.FirstOrDefault(k => k.Equals($"click:{id}", StringComparison.OrdinalIgnoreCase))
+                        ?? keys.FirstOrDefault(k => k.StartsWith($"type_and_enter:{id}:", StringComparison.OrdinalIgnoreCase))
+                        ?? keys.FirstOrDefault(k => k.StartsWith($"type:{id}:", StringComparison.OrdinalIgnoreCase));
+                }
+            }
             if (match == null)
                 return null;
             raw = match;
@@ -466,12 +562,15 @@ public class OpenRouterJevClient : IJevClient
         return null;
     }
 
+    /// <summary>Folder for openrouter-debug.log; tests point it elsewhere so they don't write into the user's log.</summary>
+    public static string? DebugLogDirectory { get; set; }
+
     /// <summary>Appends unparseable model replies to %LOCALAPPDATA%\GhostHand\openrouter-debug.log.</summary>
     private static void DebugLog(string message)
     {
         try
         {
-            var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GhostHand");
+            var dir = DebugLogDirectory ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GhostHand");
             Directory.CreateDirectory(dir);
             File.AppendAllText(Path.Combine(dir, "openrouter-debug.log"), $"[{DateTime.Now:O}] {message}\n\n");
         }

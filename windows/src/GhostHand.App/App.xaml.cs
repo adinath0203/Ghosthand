@@ -210,12 +210,12 @@ public partial class App : Application
             {
                 var credentialStore = _serviceProvider?.GetService<ICredentialStore>() ?? new CredentialStore();
                 var jevOptions = JevOptions.FromEnvironment();
-                if (string.IsNullOrWhiteSpace(jevOptions.ApiKey))
+                if (string.IsNullOrWhiteSpace(jevOptions.ApiKey) && jevOptions.RequiresApiKey)
                 {
                     jevOptions.ApiKey = credentialStore.GetApiKey();
                 }
 
-                if (string.IsNullOrWhiteSpace(jevOptions.ApiKey))
+                if (string.IsNullOrWhiteSpace(jevOptions.ApiKey) && jevOptions.RequiresApiKey)
                 {
                     _logger?.LogWarning("No API key available for agent loop.");
                     _popup?.OnRunCompleted("API key is not configured. Please set OPENROUTER_API_KEY or AI_GATEWAY_API_KEY.", false);

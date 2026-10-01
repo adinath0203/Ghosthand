@@ -9,7 +9,8 @@ public static class JevClientFactory
     public static IJevClient Create(HttpClient httpClient, JevOptions options, ILoggerFactory? loggerFactory = null)
     {
         loggerFactory ??= NullLoggerFactory.Instance;
-        return options.Provider == JevProvider.OpenRouter
+        // Laya speaks the same typed-decisions format as Jev on OpenRouter, so it shares that client
+        return options.Provider is JevProvider.OpenRouter or JevProvider.Laya or JevProvider.Groq
             ? new OpenRouterJevClient(httpClient, options, loggerFactory.CreateLogger<OpenRouterJevClient>())
             : new JevClient(httpClient, options, loggerFactory.CreateLogger<JevClient>());
     }

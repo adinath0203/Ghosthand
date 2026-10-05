@@ -18,6 +18,7 @@ public class MathEntryTests
     [InlineData("compute 7x6", "7*6")]
     [InlineData("1,200 minus 350", "1200-350")]
     [InlineData("(3 + 4) * 5", "(3+4)*5")]
+    [InlineData("calculate 450 + 430 + 80*20", "450+430+80*20")]
     public void ME01_ExtractsCalculationsAsKeyboardInput(string goal, string expected)
     {
         JevDecisionModel.ExtractMathExpression(goal).Should().Be(expected);
@@ -150,6 +151,7 @@ public class MathEntryTests
     [InlineData("450*2+90", 990)]
     [InlineData("100/4", 25)]
     [InlineData("(3+4)*5", 35)]
+    [InlineData("450+430+80*20", 2480)]
     public void ME09_EvaluateExpression(string expression, double expected)
     {
         JevDecisionModel.EvaluateExpression(expression).Should().Be((decimal)expected);

@@ -1,4 +1,4 @@
-﻿using System.Text.RegularExpressions;
+using System.Text.RegularExpressions;
 using GhostHand.Core.Agent;
 using GhostHand.Core.Interfaces;
 using GhostHand.Core.Models;

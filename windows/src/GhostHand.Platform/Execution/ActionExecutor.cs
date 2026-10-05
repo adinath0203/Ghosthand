@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Drawing;
 using FlaUI.Core.Definitions;
 using FlaUI.UIA3;
@@ -167,7 +167,10 @@ public class ActionExecutor : IActionExecutor, IDisposable
                     // clicks can't merge with the typed expression ("34" + "3+4" = 343+4)
                     InputSimulator.SendKey(VIRTUAL_KEY.VK_ESCAPE);
                     await Task.Delay(50, cancellationToken);
-                    InputSimulator.TypeText(decision.TextValue ?? string.Empty);
+                    // Type one character at a time: Calculator drops keystrokes from a single batch
+                    // SendInput call, and needs VK_MULTIPLY/VK_ADD etc. instead of Unicode for operators
+                    InputSimulator.TypeTextSlowly(decision.TextValue ?? string.Empty);
+                    await Task.Delay(50, cancellationToken);
                     InputSimulator.SendKey(VIRTUAL_KEY.VK_RETURN);
                     return ActionResult.SuccessResult($"Typed '{decision.TextValue}' on the keyboard and pressed Enter");
 
